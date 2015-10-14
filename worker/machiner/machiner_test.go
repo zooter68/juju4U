@@ -105,16 +105,16 @@ func agentConfig(tag names.Tag) agent.Config {
 }
 
 func (s *MachinerSuite) TestNotFoundOrUnauthorized(c *gc.C) {
-	mr := machiner.NewMachiner(s.machinerState, agentConfig(names.NewMachineTag("99")))
+	mr := machiner.NewMachiner(s.machinerState, agentConfig(names.NewMachineTag("99")), false)
 	c.Assert(mr.Wait(), gc.Equals, worker.ErrTerminateAgent)
 }
 
-func (s *MachinerSuite) makeMachiner() worker.Worker {
-	return machiner.NewMachiner(s.machinerState, agentConfig(s.apiMachine.Tag()))
+func (s *MachinerSuite) makeMachiner(ignoreAddresses bool) worker.Worker {
+	return machiner.NewMachiner(s.machinerState, agentConfig(s.apiMachine.Tag()), ignoreAddresses)
 }
 
 func (s *MachinerSuite) TestRunStop(c *gc.C) {
-	mr := s.makeMachiner()
+	mr := s.makeMachiner(false)
 	c.Assert(worker.Stop(mr), gc.IsNil)
 	c.Assert(s.apiMachine.Refresh(), gc.IsNil)
 	c.Assert(s.apiMachine.Life(), gc.Equals, params.Alive)
@@ -126,21 +126,21 @@ func (s *MachinerSuite) TestStartSetsStatus(c *gc.C) {
 	c.Assert(status, gc.Equals, state.StatusPending)
 	c.Assert(info, gc.Equals, "")
 
-	mr := s.makeMachiner()
+	mr := s.makeMachiner(false)
 	defer worker.Stop(mr)
 
 	s.waitMachineStatus(c, s.machine, state.StatusStarted)
 }
 
 func (s *MachinerSuite) TestSetsStatusWhenDying(c *gc.C) {
-	mr := s.makeMachiner()
+	mr := s.makeMachiner(false)
 	defer worker.Stop(mr)
 	c.Assert(s.machine.Destroy(), gc.IsNil)
 	s.waitMachineStatus(c, s.machine, state.StatusStopped)
 }
 
 func (s *MachinerSuite) TestSetDead(c *gc.C) {
-	mr := s.makeMachiner()
+	mr := s.makeMachiner(false)
 	defer worker.Stop(mr)
 	c.Assert(s.machine.Destroy(), gc.IsNil)
 	s.State.StartSync()
@@ -149,7 +149,7 @@ func (s *MachinerSuite) TestSetDead(c *gc.C) {
 	c.Assert(s.machine.Life(), gc.Equals, state.Dead)
 }
 
-func (s *MachinerSuite) TestMachineAddresses(c *gc.C) {
+func (s *MachinerSuite) setupSetMachineAddresses(c *gc.C, ignore bool) {
 	lxcFakeNetConfig := filepath.Join(c.MkDir(), "lxc-net")
 	netConf := []byte(`
   # comments ignored
@@ -183,16 +183,25 @@ LXC_BRIDGE="ignored"`[1:])
 	})
 	s.PatchValue(&network.LXCNetDefaultConfig, lxcFakeNetConfig)
 
-	mr := s.makeMachiner()
+	mr := s.makeMachiner(ignore)
 	defer worker.Stop(mr)
 	c.Assert(s.machine.Destroy(), gc.IsNil)
 	s.State.StartSync()
 	c.Assert(mr.Wait(), gc.Equals, worker.ErrTerminateAgent)
 	c.Assert(s.machine.Refresh(), gc.IsNil)
+}
+
+func (s *MachinerSuite) TestMachineAddresses(c *gc.C) {
+	s.setupSetMachineAddresses(c, false)
 	c.Assert(s.machine.MachineAddresses(), jc.DeepEquals, []network.Address{
 		network.NewAddress("2001:db8::1", network.ScopeUnknown),
 		network.NewAddress("10.0.0.1", network.ScopeCloudLocal),
 		network.NewAddress("::1", network.ScopeMachineLocal),
 		network.NewAddress("127.0.0.1", network.ScopeMachineLocal),
 	})
+}
+
+func (s *MachinerSuite) TestMachineAddressesWithIgnoreFlag(c *gc.C) {
+	s.setupSetMachineAddresses(c, true)
+	c.Assert(s.machine.MachineAddresses(), gc.HasLen, 0)
 }

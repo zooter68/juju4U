@@ -185,6 +185,40 @@ func (s *machinerSuite) TestSetMachineAddresses(c *gc.C) {
 	c.Assert(s.machine0.MachineAddresses(), gc.HasLen, 0)
 }
 
+func (s *machinerSuite) TestSetEmptyMachineAddresses(c *gc.C) {
+	// Set some addresses so we can ensure they are removed.
+	addresses := []network.Address{
+		network.NewAddress("127.0.0.1", network.ScopeUnknown),
+		network.NewAddress("8.8.8.8", network.ScopeUnknown),
+	}
+	args := params.SetMachinesAddresses{MachineAddresses: []params.MachineAddresses{
+		{Tag: "machine-1", Addresses: addresses},
+	}}
+	result, err := s.machiner.SetMachineAddresses(args)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(result, gc.DeepEquals, params.ErrorResults{
+		Results: []params.ErrorResult{
+			{nil},
+		},
+	})
+	err = s.machine1.Refresh()
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(s.machine1.MachineAddresses(), gc.HasLen, 2)
+
+	args.MachineAddresses[0].Addresses = nil
+	result, err = s.machiner.SetMachineAddresses(args)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(result, gc.DeepEquals, params.ErrorResults{
+		Results: []params.ErrorResult{
+			{nil},
+		},
+	})
+
+	err = s.machine1.Refresh()
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(s.machine1.MachineAddresses(), gc.HasLen, 0)
+}
+
 func (s *machinerSuite) TestWatch(c *gc.C) {
 	c.Assert(s.resources.Count(), gc.Equals, 0)
 
