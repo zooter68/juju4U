@@ -15,7 +15,6 @@ import (
 	"gopkg.in/tomb.v1"
 
 	"github.com/juju/juju/mongo"
-	jworker "github.com/juju/juju/worker"
 )
 
 // Hub represents a pubsub hub. The TxnWatcher only ever publishes
@@ -23,6 +22,19 @@ import (
 type Hub interface {
 	Publish(topic string, data interface{}) <-chan struct{}
 }
+
+// Clock represents the time methods used.
+type Clock interface {
+	Now() time.Time
+	After(time.Duration) <-chan time.Time
+}
+
+const (
+	txnWatcherStarting   = "starting"
+	txnWatcherCollection = "collection"
+
+	txnWatcherShortWait = 10 * time.Millisecond
+)
 
 // PollStrategy is used to determine how long
 // to delay between poll intervals. A new timer
@@ -45,7 +57,9 @@ type txnChange struct {
 // A TxnWatcher watches the txns.log collection and publishes all change events
 // to the hub.
 type TxnWatcher struct {
-	hub Hub
+	hub    Hub
+	clock  Clock
+	logger Logger
 
 	tomb         tomb.Tomb
 	iteratorFunc func() mongo.Iterator
@@ -62,20 +76,55 @@ type TxnWatcher struct {
 	lastId interface{}
 }
 
-// New returns a new Watcher observing the changelog collection,
-// which must be a capped collection maintained by mgo/txn.
-func NewTxnWatcher(changelog *mgo.Collection, hub Hub) *TxnWatcher {
-	return newTxnWatcher(changelog, hub, nil)
+// TxnWatcherConfig container the configuration parameters required
+// for a NewTxnWatcher.
+type TxnWatcherConfig struct {
+	// ChangeLog is usually the tnxs.log collection.
+	ChangeLog *mgo.Collection
+	// Hub is where the changes are published to.
+	Hub Hub
+	// Clock allows tests to control the advancing of time.
+	Clock Clock
+	// Logger is used to control where the log messages for this watcher go.
+	Logger Logger
+	// IteratorFunc can be overridden in tests to control what values the
+	// watcher sees.
+	IteratorFunc func() mongo.Iterator
 }
 
-func newTxnWatcher(changelog *mgo.Collection, hub Hub, iteratorFunc func() mongo.Iterator) *TxnWatcher {
+// Validate ensures that all the values that have to be set are set.
+func (config TxnWatcherConfig) Validate() error {
+	if config.ChangeLog == nil {
+		return errors.NotValidf("missing ChangeLog")
+	}
+	if config.Hub == nil {
+		return errors.NotValidf("missing Hub")
+	}
+	if config.Clock == nil {
+		return errors.NotValidf("missing Clock")
+	}
+	return nil
+}
+
+// New returns a new Watcher observing the changelog collection,
+// which must be a capped collection maintained by mgo/txn.
+func NewTxnWatcher(config TxnWatcherConfig) (*TxnWatcher, error) {
+	if err := config.Validate(); err != nil {
+		return nil, errors.Annotate(err, "new TxnWatcher invalid config")
+	}
+
 	w := &TxnWatcher{
-		hub:          hub,
-		log:          changelog,
-		iteratorFunc: iteratorFunc,
+		hub:          config.Hub,
+		clock:        config.Clock,
+		logger:       config.Logger,
+		log:          config.ChangeLog,
+		iteratorFunc: config.IteratorFunc,
 	}
 	if w.iteratorFunc == nil {
 		w.iteratorFunc = w.iter
+	}
+	if w.logger == nil {
+		w.logger = noOpLogger{}
 	}
 	go func() {
 		err := w.loop()
@@ -84,12 +133,12 @@ func newTxnWatcher(changelog *mgo.Collection, hub Hub, iteratorFunc func() mongo
 		// exact values, so we need to log and unwrap
 		// the error first.
 		if err != nil && cause != tomb.ErrDying {
-			logger.Infof("watcher loop failed: %v", err)
+			w.logger.Infof("watcher loop failed: %v", err)
 		}
 		w.tomb.Kill(cause)
 		w.tomb.Done()
 	}()
-	return w
+	return w, nil
 }
 
 // Kill is part of the worker.Worker interface.
@@ -123,43 +172,37 @@ func (w *TxnWatcher) Err() error {
 // loop implements the main watcher loop.
 // period is the delay between each sync.
 func (w *TxnWatcher) loop() error {
-	shortWait := 10 * time.Millisecond
 	if err := w.initLastId(); err != nil {
 		return errors.Trace(err)
 	}
-	// TODO: thumper add Clock
-	backoff := PollStrategy.NewTimer(time.Now())
-	next := time.After(shortWait)
+	// Make sure we have read the last ID before telling people
+	// we have started.
+	w.hub.Publish(txnWatcherStarting, nil)
+	backoff := PollStrategy.NewTimer(w.clock.Now())
+	next := w.clock.After(txnWatcherShortWait)
 	for {
+		select {
+		case <-w.tomb.Dying():
+			return errors.Trace(tomb.ErrDying)
+		case <-next:
+			d, ok := backoff.NextSleep(w.clock.Now())
+			if !ok {
+				// This shouldn't happen, but be defensive.
+				backoff = PollStrategy.NewTimer(w.clock.Now())
+			}
+			next = w.clock.After(d)
+		}
+
 		added, err := w.sync()
 		if err != nil {
-			// If the txn log collection overflows from underneath us,
-			// the easiest cause of action to recover is to cause the
-			// agen tto restart.
-			if errors.Cause(err) == cappedPositionLostError {
-				// Ideally we'd not import the worker package but that's
-				// where all the errors are defined.
-				return jworker.ErrRestartAgent
-			}
 			return errors.Trace(err)
 		}
 		w.flush()
 		if added {
 			// Something's happened, so reset the exponential backoff
 			// so we'll retry again quickly.
-			backoff = PollStrategy.NewTimer(time.Now())
-			next = time.After(shortWait)
-		}
-		select {
-		case <-w.tomb.Dying():
-			return errors.Trace(tomb.ErrDying)
-		case <-next:
-			d, ok := backoff.NextSleep(time.Now())
-			if !ok {
-				// This shouldn't happen, but be defensive.
-				backoff = PollStrategy.NewTimer(time.Now())
-			}
-			next = time.After(d)
+			backoff = PollStrategy.NewTimer(w.clock.Now())
+			next = w.clock.After(txnWatcherShortWait)
 		}
 	}
 }
@@ -169,7 +212,7 @@ func (w *TxnWatcher) flush() {
 	// refreshEvents are stored newest first.
 	for i := len(w.syncEvents) - 1; i >= 0; i-- {
 		e := w.syncEvents[i]
-		w.hub.Publish(e.C, e)
+		w.hub.Publish(txnWatcherCollection, e)
 	}
 	w.syncEvents = w.syncEvents[:0]
 }
@@ -205,11 +248,11 @@ func (w *TxnWatcher) sync() (bool, error) {
 	var entry bson.D
 	for iter.Next(&entry) {
 		if len(entry) == 0 {
-			logger.Tracef("got empty changelog document")
+			w.logger.Tracef("got empty changelog document")
 		}
 		id := entry[0]
 		if id.Name != "_id" {
-			logger.Warningf("watcher: _id field isn't first entry")
+			w.logger.Warningf("watcher: _id field isn't first entry")
 			continue
 		}
 		if first {
@@ -219,7 +262,7 @@ func (w *TxnWatcher) sync() (bool, error) {
 		if id.Value == lastId {
 			break
 		}
-		logger.Tracef("got changelog document: %#v", entry)
+		w.logger.Tracef("got changelog document: %#v", entry)
 		for _, c := range entry[1:] {
 			// See txn's Runner.ChangeLog for the structure of log entries.
 			var d, r []interface{}
@@ -233,7 +276,7 @@ func (w *TxnWatcher) sync() (bool, error) {
 				}
 			}
 			if len(d) == 0 || len(d) != len(r) {
-				logger.Warningf("changelog has invalid collection document: %#v", c)
+				w.logger.Warningf("changelog has invalid collection document: %#v", c)
 				continue
 			}
 			for i := len(d) - 1; i >= 0; i-- {
@@ -244,7 +287,7 @@ func (w *TxnWatcher) sync() (bool, error) {
 				seen[key] = true
 				revno, ok := r[i].(int64)
 				if !ok {
-					logger.Warningf("changelog has revno with type %T: %#v", r[i], r[i])
+					w.logger.Warningf("changelog has revno with type %T: %#v", r[i], r[i])
 					continue
 				}
 				if revno < 0 {
@@ -264,7 +307,7 @@ func (w *TxnWatcher) sync() (bool, error) {
 			// CappedPositionLost is code 136.
 			// Just in case that changes for some reason, we'll also check the error message.
 			if qerr.Code == 136 || strings.Contains(qerr.Message, "CappedPositionLost") {
-				logger.Warningf("watcher iterator failed due to txn log collection overflow")
+				w.logger.Warningf("watcher iterator failed due to txn log collection overflow")
 				err = cappedPositionLostError
 			}
 		}

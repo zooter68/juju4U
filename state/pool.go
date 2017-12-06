@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/juju/errors"
+	"github.com/juju/loggo"
 	"github.com/juju/pubsub"
 	"gopkg.in/juju/names.v2"
 	"gopkg.in/juju/worker.v1"
@@ -36,7 +37,13 @@ func NewStatePool(systemState *State) *StatePool {
 		}),
 	}
 	pool.watcherRunner.StartWorker(txnLogWorker, func() (worker.Worker, error) {
-		return watcher.NewTxnWatcher(systemState.getTxnLogCollection(), pool.hub), nil
+		return watcher.NewTxnWatcher(
+			watcher.TxnWatcherConfig{
+				ChangeLog: systemState.getTxnLogCollection(),
+				Hub:       pool.hub,
+				Clock:     systemState.clock(),
+				Logger:    loggo.GetLogger("juju.state.pool.txnwatcher"),
+			})
 	})
 	return pool
 }

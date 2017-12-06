@@ -9,6 +9,12 @@ import (
 	"github.com/juju/juju/mongo"
 )
 
+const (
+	TxnWatcherStarting   = txnWatcherStarting
+	TxnWatcherCollection = txnWatcherCollection
+	TxnWatcherShortWait  = txnWatcherShortWait
+)
+
 func NewTestWatcher(changelog *mgo.Collection, iteratorFunc func() mongo.Iterator) *Watcher {
 	return newWatcher(changelog, iteratorFunc)
 }

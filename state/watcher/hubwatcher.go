@@ -82,15 +82,27 @@ func NewHubWatcher(hub HubSource, logger Logger) *HubWatcher {
 	return w
 }
 
-func (w *HubWatcher) recieveEvent(_ string, data interface{}) {
-	change, ok := data.(Change)
-	if !ok {
-		w.logger.Warningf("incoming event not a Chage")
-		return
-	}
-	select {
-	case w.changes <- change:
-	case <-w.tomb.Dying():
+func (w *HubWatcher) recieveEvent(topic string, data interface{}) {
+	switch topic {
+	case txnWatcherStarting:
+		// This message is published when the main txns.log watcher starts. If
+		// this message is recieved here it means that the main watcher has
+		// restarted. It is highly likely that it restarted because it lost
+		// track of where it was, or the connection shut down. Either way, we
+		// need to stop this worker to release all the watchers.
+		w.tomb.Kill(errors.New("txns.log watcher restarted"))
+	case txnWatcherCollection:
+		change, ok := data.(Change)
+		if !ok {
+			w.logger.Warningf("incoming event not a Chage")
+			return
+		}
+		select {
+		case w.changes <- change:
+		case <-w.tomb.Dying():
+		}
+	default:
+		w.logger.Warningf("programming error, unknown topic: %q", topic)
 	}
 }
 
