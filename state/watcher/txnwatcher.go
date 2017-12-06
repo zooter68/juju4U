@@ -1,0 +1,274 @@
+// Copyright 2012, 2013 Canonical Ltd.
+// Licensed under the AGPLv3, see LICENCE file for details.
+
+package watcher
+
+import (
+	"strings"
+	"time"
+
+	"github.com/juju/errors"
+	"gopkg.in/juju/worker.v1"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
+	"gopkg.in/retry.v1"
+	"gopkg.in/tomb.v1"
+
+	"github.com/juju/juju/mongo"
+	jworker "github.com/juju/juju/worker"
+)
+
+// Hub represents a pubsub hub. The TxnWatcher only ever publishes
+// events to the hub.
+type Hub interface {
+	Publish(topic string, data interface{}) <-chan struct{}
+}
+
+// PollStrategy is used to determine how long
+// to delay between poll intervals. A new timer
+// is created each time some watcher event is
+// fired or if the old timer completes.
+//
+// It must not be changed when any watchers are active.
+var PollStrategy retry.Strategy = retry.Exponential{
+	Initial:  10 * time.Millisecond,
+	Factor:   1.5,
+	MaxDelay: 5 * time.Second,
+}
+
+type txnChange struct {
+	collection string
+	docID      interface{}
+	revID      int64
+}
+
+// A TxnWatcher watches the txns.log collection and publishes all change events
+// to the hub.
+type TxnWatcher struct {
+	hub Hub
+
+	tomb         tomb.Tomb
+	iteratorFunc func() mongo.Iterator
+	log          *mgo.Collection
+
+	// syncEvents contain the events to be
+	// dispatched to the watcher channels. They're queued during
+	// processing and flushed at the end to simplify the algorithm.
+	// The two queues are separated because events from sync are
+	// handled in reverse order due to the way the algorithm works.
+	syncEvents []Change
+
+	// lastId is the most recent transaction id observed by a sync.
+	lastId interface{}
+}
+
+// New returns a new Watcher observing the changelog collection,
+// which must be a capped collection maintained by mgo/txn.
+func NewTxnWatcher(changelog *mgo.Collection, hub Hub) *TxnWatcher {
+	return newTxnWatcher(changelog, hub, nil)
+}
+
+func newTxnWatcher(changelog *mgo.Collection, hub Hub, iteratorFunc func() mongo.Iterator) *TxnWatcher {
+	w := &TxnWatcher{
+		hub:          hub,
+		log:          changelog,
+		iteratorFunc: iteratorFunc,
+	}
+	if w.iteratorFunc == nil {
+		w.iteratorFunc = w.iter
+	}
+	go func() {
+		err := w.loop()
+		cause := errors.Cause(err)
+		// tomb expects ErrDying or ErrStillAlive as
+		// exact values, so we need to log and unwrap
+		// the error first.
+		if err != nil && cause != tomb.ErrDying {
+			logger.Infof("watcher loop failed: %v", err)
+		}
+		w.tomb.Kill(cause)
+		w.tomb.Done()
+	}()
+	return w
+}
+
+// Kill is part of the worker.Worker interface.
+func (w *TxnWatcher) Kill() {
+	w.tomb.Kill(nil)
+}
+
+// Wait is part of the worker.Worker interface.
+func (w *TxnWatcher) Wait() error {
+	return w.tomb.Wait()
+}
+
+// Stop stops all the watcher activities.
+func (w *TxnWatcher) Stop() error {
+	return worker.Stop(w)
+}
+
+// Dead returns a channel that is closed when the watcher has stopped.
+func (w *TxnWatcher) Dead() <-chan struct{} {
+	return w.tomb.Dead()
+}
+
+// Err returns the error with which the watcher stopped.
+// It returns nil if the watcher stopped cleanly, tomb.ErrStillAlive
+// if the watcher is still running properly, or the respective error
+// if the watcher is terminating or has terminated with an error.
+func (w *TxnWatcher) Err() error {
+	return w.tomb.Err()
+}
+
+// loop implements the main watcher loop.
+// period is the delay between each sync.
+func (w *TxnWatcher) loop() error {
+	shortWait := 10 * time.Millisecond
+	if err := w.initLastId(); err != nil {
+		return errors.Trace(err)
+	}
+	// TODO: thumper add Clock
+	backoff := PollStrategy.NewTimer(time.Now())
+	next := time.After(shortWait)
+	for {
+		added, err := w.sync()
+		if err != nil {
+			// If the txn log collection overflows from underneath us,
+			// the easiest cause of action to recover is to cause the
+			// agen tto restart.
+			if errors.Cause(err) == cappedPositionLostError {
+				// Ideally we'd not import the worker package but that's
+				// where all the errors are defined.
+				return jworker.ErrRestartAgent
+			}
+			return errors.Trace(err)
+		}
+		w.flush()
+		if added {
+			// Something's happened, so reset the exponential backoff
+			// so we'll retry again quickly.
+			backoff = PollStrategy.NewTimer(time.Now())
+			next = time.After(shortWait)
+		}
+		select {
+		case <-w.tomb.Dying():
+			return errors.Trace(tomb.ErrDying)
+		case <-next:
+			d, ok := backoff.NextSleep(time.Now())
+			if !ok {
+				// This shouldn't happen, but be defensive.
+				backoff = PollStrategy.NewTimer(time.Now())
+			}
+			next = time.After(d)
+		}
+	}
+}
+
+// flush sends all pending events to their respective channels.
+func (w *TxnWatcher) flush() {
+	// refreshEvents are stored newest first.
+	for i := len(w.syncEvents) - 1; i >= 0; i-- {
+		e := w.syncEvents[i]
+		w.hub.Publish(e.C, e)
+	}
+	w.syncEvents = w.syncEvents[:0]
+}
+
+// initLastId reads the most recent changelog document and initializes
+// lastId with it. This causes all history that precedes the creation
+// of the watcher to be ignored.
+func (w *TxnWatcher) initLastId() error {
+	var entry struct {
+		Id interface{} `bson:"_id"`
+	}
+	err := w.log.Find(nil).Sort("-$natural").One(&entry)
+	if err != nil && err != mgo.ErrNotFound {
+		return errors.Trace(err)
+	}
+	w.lastId = entry.Id
+	return nil
+}
+
+func (w *TxnWatcher) iter() mongo.Iterator {
+	return w.log.Find(nil).Batch(10).Sort("-$natural").Iter()
+}
+
+// sync updates the watcher knowledge from the database, and
+// queues events to observing channels.
+func (w *TxnWatcher) sync() (bool, error) {
+	added := false
+	// Iterate through log events in reverse insertion order (newest first).
+	iter := w.iteratorFunc()
+	seen := make(map[watchKey]bool)
+	first := true
+	lastId := w.lastId
+	var entry bson.D
+	for iter.Next(&entry) {
+		if len(entry) == 0 {
+			logger.Tracef("got empty changelog document")
+		}
+		id := entry[0]
+		if id.Name != "_id" {
+			logger.Warningf("watcher: _id field isn't first entry")
+			continue
+		}
+		if first {
+			w.lastId = id.Value
+			first = false
+		}
+		if id.Value == lastId {
+			break
+		}
+		logger.Tracef("got changelog document: %#v", entry)
+		for _, c := range entry[1:] {
+			// See txn's Runner.ChangeLog for the structure of log entries.
+			var d, r []interface{}
+			dr, _ := c.Value.(bson.D)
+			for _, item := range dr {
+				switch item.Name {
+				case "d":
+					d, _ = item.Value.([]interface{})
+				case "r":
+					r, _ = item.Value.([]interface{})
+				}
+			}
+			if len(d) == 0 || len(d) != len(r) {
+				logger.Warningf("changelog has invalid collection document: %#v", c)
+				continue
+			}
+			for i := len(d) - 1; i >= 0; i-- {
+				key := watchKey{c.Name, d[i]}
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				revno, ok := r[i].(int64)
+				if !ok {
+					logger.Warningf("changelog has revno with type %T: %#v", r[i], r[i])
+					continue
+				}
+				if revno < 0 {
+					revno = -1
+				}
+				w.syncEvents = append(w.syncEvents, Change{
+					C:     c.Name,
+					Id:    d[i],
+					Revno: revno,
+				})
+				added = true
+			}
+		}
+	}
+	if err := iter.Close(); err != nil {
+		if qerr, ok := err.(*mgo.QueryError); ok {
+			// CappedPositionLost is code 136.
+			// Just in case that changes for some reason, we'll also check the error message.
+			if qerr.Code == 136 || strings.Contains(qerr.Message, "CappedPositionLost") {
+				logger.Warningf("watcher iterator failed due to txn log collection overflow")
+				err = cappedPositionLostError
+			}
+		}
+		return false, errors.Annotate(err, "watcher iteration error")
+	}
+	return added, nil
+}
