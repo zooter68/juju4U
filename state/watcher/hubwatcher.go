@@ -50,9 +50,15 @@ type HubWatcher struct {
 // NewHubWatcher returns a new watcher observing Change events published to the
 // hub.
 func NewHubWatcher(hub HubSource, logger Logger) *HubWatcher {
+	watcher, _ := newHubWatcher(hub, logger)
+	return watcher
+}
+
+func newHubWatcher(hub HubSource, logger Logger) (*HubWatcher, <-chan struct{}) {
 	if logger == nil {
 		logger = noOpLogger{}
 	}
+	started := make(chan struct{})
 	w := &HubWatcher{
 		hub:     hub,
 		logger:  logger,
@@ -68,6 +74,7 @@ func NewHubWatcher(hub HubSource, logger Logger) *HubWatcher {
 			func(string) bool { return true }, w.recieveEvent,
 		)
 		defer unsub()
+		close(started)
 		err := w.loop()
 		cause := errors.Cause(err)
 		// tomb expects ErrDying or ErrStillAlive as
@@ -79,7 +86,7 @@ func NewHubWatcher(hub HubSource, logger Logger) *HubWatcher {
 		w.tomb.Kill(cause)
 		w.tomb.Done()
 	}()
-	return w
+	return w, started
 }
 
 func (w *HubWatcher) recieveEvent(topic string, data interface{}) {
@@ -90,7 +97,7 @@ func (w *HubWatcher) recieveEvent(topic string, data interface{}) {
 		// restarted. It is highly likely that it restarted because it lost
 		// track of where it was, or the connection shut down. Either way, we
 		// need to stop this worker to release all the watchers.
-		w.tomb.Kill(errors.New("txns.log watcher restarted"))
+		w.tomb.Kill(errors.New("txn watcher restarted"))
 	case txnWatcherCollection:
 		change, ok := data.(Change)
 		if !ok {
@@ -185,6 +192,7 @@ func (w *HubWatcher) UnwatchCollection(collection string, ch chan<- Change) {
 // period is the delay between each sync.
 func (w *HubWatcher) loop() error {
 	for {
+		w.logger.Warningf("loop() select")
 		select {
 		case <-w.tomb.Dying():
 			return errors.Trace(tomb.ErrDying)
@@ -193,7 +201,9 @@ func (w *HubWatcher) loop() error {
 		case req := <-w.request:
 			w.handle(req)
 		}
-		w.flush()
+		for (len(w.syncEvents) + len(w.requestEvents)) > 0 {
+			w.flush()
+		}
 	}
 }
 
@@ -201,28 +211,17 @@ func (w *HubWatcher) flush() {
 	// syncEvents are stored first in first out.
 	for i := 0; i < len(w.syncEvents); i++ {
 		e := &w.syncEvents[i]
+		w.logger.Warningf("flushing syncEvent %#v", e)
 		for e.ch != nil {
+			w.logger.Warningf("flush() select for syncEvents")
 			select {
 			case <-w.tomb.Dying():
 				return
 			case req := <-w.request:
 				w.handle(req)
 				continue
-			case e.ch <- Change{e.key.c, e.key.id, e.revno}:
-			}
-			break
-		}
-	}
-	// requestEvents are stored oldest first, and
-	// may grow during the loop.
-	for i := 0; i < len(w.requestEvents); i++ {
-		e := &w.requestEvents[i]
-		for e.ch != nil {
-			select {
-			case <-w.tomb.Dying():
-				return
-			case req := <-w.request:
-				w.handle(req)
+			case change := <-w.changes:
+				w.queueChange(change)
 				continue
 			case e.ch <- Change{e.key.c, e.key.id, e.revno}:
 			}
@@ -230,6 +229,28 @@ func (w *HubWatcher) flush() {
 		}
 	}
 	w.syncEvents = w.syncEvents[:0]
+
+	// requestEvents are stored oldest first, and
+	// may grow during the loop.
+	for i := 0; i < len(w.requestEvents); i++ {
+		e := &w.requestEvents[i]
+		w.logger.Warningf("flushing requestEvent %#v", e)
+		for e.ch != nil {
+			w.logger.Warningf("flush() select for requestEvents")
+			select {
+			case <-w.tomb.Dying():
+				return
+			case req := <-w.request:
+				w.handle(req)
+				continue
+			case change := <-w.changes:
+				w.queueChange(change)
+				continue
+			case e.ch <- Change{e.key.c, e.key.id, e.revno}:
+			}
+			break
+		}
+	}
 	w.requestEvents = w.requestEvents[:0]
 }
 
