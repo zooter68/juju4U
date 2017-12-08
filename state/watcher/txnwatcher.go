@@ -4,7 +4,6 @@
 package watcher
 
 import (
-	"strings"
 	"time"
 
 	"github.com/juju/errors"
@@ -303,14 +302,6 @@ func (w *TxnWatcher) sync() (bool, error) {
 		}
 	}
 	if err := iter.Close(); err != nil {
-		if qerr, ok := err.(*mgo.QueryError); ok {
-			// CappedPositionLost is code 136.
-			// Just in case that changes for some reason, we'll also check the error message.
-			if qerr.Code == 136 || strings.Contains(qerr.Message, "CappedPositionLost") {
-				w.logger.Warningf("watcher iterator failed due to txn log collection overflow")
-				err = cappedPositionLostError
-			}
-		}
 		return false, errors.Annotate(err, "watcher iteration error")
 	}
 	return added, nil

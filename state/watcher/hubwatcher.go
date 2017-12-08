@@ -68,8 +68,6 @@ func newHubWatcher(hub HubSource, logger Logger) (*HubWatcher, <-chan struct{}) 
 		changes: make(chan Change),
 	}
 	go func() {
-		// TODO: consider an event to restart the hub watcher
-		// if the txnwatcher restarts.
 		unsub := hub.SubscribeMatch(
 			func(string) bool { return true }, w.receiveEvent,
 		)
