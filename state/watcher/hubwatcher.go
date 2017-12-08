@@ -71,7 +71,7 @@ func newHubWatcher(hub HubSource, logger Logger) (*HubWatcher, <-chan struct{}) 
 		// TODO: consider an event to restart the hub watcher
 		// if the txnwatcher restarts.
 		unsub := hub.SubscribeMatch(
-			func(string) bool { return true }, w.recieveEvent,
+			func(string) bool { return true }, w.receiveEvent,
 		)
 		defer unsub()
 		close(started)
@@ -89,11 +89,11 @@ func newHubWatcher(hub HubSource, logger Logger) (*HubWatcher, <-chan struct{}) 
 	return w, started
 }
 
-func (w *HubWatcher) recieveEvent(topic string, data interface{}) {
+func (w *HubWatcher) receiveEvent(topic string, data interface{}) {
 	switch topic {
 	case txnWatcherStarting:
 		// This message is published when the main txns.log watcher starts. If
-		// this message is recieved here it means that the main watcher has
+		// this message is received here it means that the main watcher has
 		// restarted. It is highly likely that it restarted because it lost
 		// track of where it was, or the connection shut down. Either way, we
 		// need to stop this worker to release all the watchers.
@@ -192,7 +192,6 @@ func (w *HubWatcher) UnwatchCollection(collection string, ch chan<- Change) {
 // period is the delay between each sync.
 func (w *HubWatcher) loop() error {
 	for {
-		w.logger.Warningf("loop() select")
 		select {
 		case <-w.tomb.Dying():
 			return errors.Trace(tomb.ErrDying)
@@ -211,9 +210,7 @@ func (w *HubWatcher) flush() {
 	// syncEvents are stored first in first out.
 	for i := 0; i < len(w.syncEvents); i++ {
 		e := &w.syncEvents[i]
-		w.logger.Warningf("flushing syncEvent %#v", e)
 		for e.ch != nil {
-			w.logger.Warningf("flush() select for syncEvents")
 			select {
 			case <-w.tomb.Dying():
 				return
@@ -234,9 +231,7 @@ func (w *HubWatcher) flush() {
 	// may grow during the loop.
 	for i := 0; i < len(w.requestEvents); i++ {
 		e := &w.requestEvents[i]
-		w.logger.Warningf("flushing requestEvent %#v", e)
 		for e.ch != nil {
-			w.logger.Warningf("flush() select for requestEvents")
 			select {
 			case <-w.tomb.Dying():
 				return

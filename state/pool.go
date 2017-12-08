@@ -28,23 +28,28 @@ func NewStatePool(systemState *State) *StatePool {
 		systemState: systemState,
 		pool:        make(map[string]*PoolItem),
 		hub:         pubsub.NewSimpleHub(nil),
-		watcherRunner: worker.NewRunner(worker.RunnerParams{
+	}
+	// If systemState is nil, this is clearly a test, and a poorly
+	// isolated one. However now is not the time to fix all those broken
+	// tests.
+	if systemState != nil {
+		pool.watcherRunner = worker.NewRunner(worker.RunnerParams{
 			// TODO add a Logger parameter to RunnerParams:
 			// Logger: loggo.GetLogger(logger.Name() + ".txnwatcher"),
 			IsFatal:      func(err error) bool { return errors.Cause(err) == errPoolClosed },
 			RestartDelay: time.Second,
 			Clock:        systemState.clock(),
-		}),
+		})
+		pool.watcherRunner.StartWorker(txnLogWorker, func() (worker.Worker, error) {
+			return watcher.NewTxnWatcher(
+				watcher.TxnWatcherConfig{
+					ChangeLog: systemState.getTxnLogCollection(),
+					Hub:       pool.hub,
+					Clock:     systemState.clock(),
+					Logger:    loggo.GetLogger("juju.state.pool.txnwatcher"),
+				})
+		})
 	}
-	pool.watcherRunner.StartWorker(txnLogWorker, func() (worker.Worker, error) {
-		return watcher.NewTxnWatcher(
-			watcher.TxnWatcherConfig{
-				ChangeLog: systemState.getTxnLogCollection(),
-				Hub:       pool.hub,
-				Clock:     systemState.clock(),
-				Logger:    loggo.GetLogger("juju.state.pool.txnwatcher"),
-			})
-	})
 	return pool
 }
 
@@ -268,7 +273,9 @@ func (p *StatePool) Close() error {
 		}
 	}
 	p.pool = make(map[string]*PoolItem)
-	worker.Stop(p.watcherRunner)
+	if p.watcherRunner != nil {
+		worker.Stop(p.watcherRunner)
+	}
 	return errors.Annotate(lastErr, "at least one error closing a state")
 }
 
